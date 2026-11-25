@@ -19,7 +19,9 @@ USE_TZ=True
 STATIC_URL='static/'
 STATIC_ROOT=BASE_DIR/'staticfiles'
 DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
-CORS_ALLOWED_ORIGINS=[x.strip() for x in os.getenv('CORS_ALLOWED_ORIGINS','http://localhost:5173').split(',') if x.strip()]
+CORS_ALLOWED_ORIGINS = [
+    "https://29m.vercel.app",
+]
 CORS_ALLOW_HEADERS=['accept','authorization','content-type','user-agent','x-csrftoken','x-requested-with']
 REST_FRAMEWORK={'DEFAULT_AUTHENTICATION_CLASSES':('school.authentication.SchoolJWTAuthentication',),'DEFAULT_PERMISSION_CLASSES':('rest_framework.permissions.AllowAny',),'DEFAULT_RENDERER_CLASSES':('rest_framework.renderers.JSONRenderer',)}
 from datetime import timedelta
