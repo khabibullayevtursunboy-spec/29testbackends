@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: school-test-api
+    runtime: python
+    buildCommand: ./build.sh
+    startCommand: gunicorn config.wsgi:application
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: school-test-db
+          property: connectionString
+      - key: ALLOWED_HOSTS
+        value: .onrender.com
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://YOUR-FRONTEND.vercel.app
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+databases:
+  - name: school-test-db
+    databaseName: school_test
+    user: school_test_user
