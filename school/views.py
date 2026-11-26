@@ -1,4 +1,5 @@
-import os, secrets, string
+import os, secrets, string, json
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import timedelta
 from django.utils import timezone
 from django.db import transaction
@@ -376,7 +377,10 @@ def teacher_required(r):
     u = actor(r, 'teacher')
     if not u:
         return None, None
-    return u, Teacher.objects.get(user=u)
+    try:
+        return u, Teacher.objects.get(user=u)
+    except Teacher.DoesNotExist:
+        return None, None
 
 
 def test_json(t):
@@ -583,21 +587,219 @@ def teacher_test_item(r, pk):
 @permission_classes([IsAuthenticated])
 def teacher_results(r):
     u, t = teacher_required(r)
-    if not u:
+    if not u or not t:
         return err('Ruxsat yo‘q.', 403)
-    rows = TestResult.objects.filter(teacher=t).select_related(
-        'student', 'school_class', 'test', 'attempt').order_by('-submitted_at')
-    return Response({'results': [{
-        'id': x.id, 'attempt_id': x.attempt_id, 'test_id': x.test_id, 'student_id': x.student_id,
-        'total_questions': x.total_questions, 'correct_count': x.correct_count, 'wrong_count': x.wrong_count,
-        'earned_points': x.earned_points, 'max_points': x.max_points, 'percentage': x.percentage,
-        'grade': x.grade, 'time_spent_seconds': x.time_spent_seconds, 'submitted_at': x.submitted_at,
-        'started_at': x.attempt.started_at, 'first_name': x.student.first_name,
-        'last_name': x.student.last_name, 'student_code': x.student.student_code,
-        'class_id': x.school_class_id, 'class_name': x.school_class.name, 'test_title': x.test.title,
-        'subject_name': x.test.subject.name,
-        'violation_count': Violation.objects.filter(attempt=x.attempt).count(),
-        'is_terminated': x.is_terminated, 'attempt_status': x.attempt.status} for x in rows]})
+
+    rows = (
+        TestResult.objects
+        .filter(teacher=t)
+        .select_related(
+            'student',
+            'school_class',
+            'test',
+            'test__subject',
+            'attempt',
+        )
+        .annotate(violation_count=Count('attempt__violation'))
+    )
+
+    # Eski va yangi frontend parametr nomlarini qo‘llab-quvvatlaymiz.
+    filter_specs = (
+        (('classId', 'class_id'), 'school_class_id', 'Sinf'),
+        (('subjectId', 'subject_id'), 'test__subject_id', 'Fan'),
+        (('testId', 'test_id'), 'test_id', 'Test'),
+    )
+
+    for param_names, model_field, label in filter_specs:
+        raw_value = None
+        for param_name in param_names:
+            if param_name in r.query_params:
+                raw_value = r.query_params.get(param_name)
+                break
+
+        if raw_value is None:
+            continue
+
+        raw_value = str(raw_value).strip()
+        if raw_value.lower() in ('', 'all', 'none', 'null', 'undefined'):
+            continue
+
+        try:
+            filter_id = int(raw_value)
+        except (TypeError, ValueError):
+            return err(f'{label} filtri uchun ID butun son bo‘lishi kerak.')
+
+        if filter_id <= 0:
+            return err(f'{label} filtri uchun ID musbat bo‘lishi kerak.')
+
+        rows = rows.filter(**{model_field: filter_id})
+
+    rows = rows.order_by('-submitted_at', '-id')
+
+    result_items = []
+    for x in rows:
+        result_items.append({
+            'id': x.id,
+            'attempt_id': x.attempt_id,
+            'test_id': x.test_id,
+            'student_id': x.student_id,
+            'total_questions': x.total_questions,
+            'correct_count': x.correct_count,
+            'wrong_count': x.wrong_count,
+            'earned_points': x.earned_points,
+            'max_points': x.max_points,
+            'percentage': x.percentage,
+            'grade': x.grade,
+            'time_spent_seconds': x.time_spent_seconds,
+            'submitted_at': x.submitted_at,
+            'started_at': x.attempt.started_at,
+            'first_name': x.student.first_name,
+            'last_name': x.student.last_name,
+            'student_code': x.student.student_code,
+            'class_id': x.school_class_id,
+            'class_name': x.school_class.name,
+            'test_title': x.test.title,
+            'subject_id': x.test.subject_id,
+            'subject_name': x.test.subject.name,
+            'violation_count': x.violation_count,
+            'is_terminated': x.is_terminated,
+            'attempt_status': x.attempt.status,
+        })
+
+    return Response({'results': result_items})
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def teacher_result_update(r, pk):
+    u, t = teacher_required(r)
+    if not u or not t:
+        return err('Faqat tizimga kirgan o‘qituvchi uchun.', 403)
+
+    # Boshqa o‘qituvchining natijasi hech qachon query'dan olinmaydi.
+    try:
+        with transaction.atomic():
+            result = (
+                TestResult.objects
+                .select_for_update()
+                .select_related('student', 'test', 'school_class')
+                .get(pk=pk, teacher=t)
+            )
+
+            old_values = {
+                'correct_count': result.correct_count,
+                'wrong_count': result.wrong_count,
+                'percentage': result.percentage,
+                'grade': result.grade,
+                'earned_points': result.earned_points,
+            }
+
+            data = r.data
+
+            correct_count = result.correct_count
+            if 'correct_count' in data:
+                raw_correct = data.get('correct_count')
+                if isinstance(raw_correct, bool):
+                    return err('To‘g‘ri javoblar soni butun son bo‘lishi kerak.')
+                try:
+                    correct_count = int(raw_correct)
+                except (TypeError, ValueError, OverflowError):
+                    return err('To‘g‘ri javoblar soni butun son bo‘lishi kerak.')
+
+                if str(raw_correct).strip() != str(correct_count):
+                    return err('To‘g‘ri javoblar soni butun son bo‘lishi kerak.')
+                if not 0 <= correct_count <= result.total_questions:
+                    return err(
+                        f'To‘g‘ri javoblar soni 0 dan {result.total_questions} gacha bo‘lishi kerak.'
+                    )
+
+            percentage = Decimal(str(result.percentage))
+            if 'percentage' in data:
+                try:
+                    percentage = Decimal(str(data.get('percentage')))
+                except (InvalidOperation, TypeError, ValueError):
+                    return err('Foiz son bo‘lishi kerak.')
+
+                if not percentage.is_finite() or percentage < 0 or percentage > 100:
+                    return err('Foiz 0 dan 100 gacha bo‘lishi kerak.')
+
+            raw_grade = data.get('grade', None)
+            if raw_grade in (None, ''):
+                grade = (
+                    '5' if percentage >= Decimal('86') else
+                    '4' if percentage >= Decimal('71') else
+                    '3' if percentage >= Decimal('56') else
+                    '2'
+                )
+            else:
+                grade = str(raw_grade).strip()
+                if grade not in ('2', '3', '4', '5'):
+                    return err('Baho faqat 2, 3, 4 yoki 5 bo‘lishi mumkin.')
+
+            percentage_value = float(percentage.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+            earned_points = int(
+                (Decimal(result.max_points) * Decimal(str(percentage_value)) / Decimal('100'))
+                .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+            )
+
+            result.correct_count = correct_count
+            result.wrong_count = result.total_questions - correct_count
+            result.percentage = percentage_value
+            result.grade = grade
+            result.earned_points = earned_points
+            result.save(update_fields=[
+                'correct_count',
+                'wrong_count',
+                'percentage',
+                'grade',
+                'earned_points',
+            ])
+
+            new_values = {
+                'correct_count': result.correct_count,
+                'wrong_count': result.wrong_count,
+                'percentage': result.percentage,
+                'grade': result.grade,
+                'earned_points': result.earned_points,
+            }
+
+            if old_values != new_values:
+                Activity.objects.create(
+                    actor_role='teacher',
+                    actor_name=u.full_name,
+                    action='O‘quvchi test natijasi qo‘lda tahrirlandi',
+                    target_type='TestResult',
+                    target_id=str(result.id),
+                    details=json.dumps({
+                        'result_id': result.id,
+                        'student_id': result.student_id,
+                        'student_name': f'{result.student.first_name} {result.student.last_name}',
+                        'test_id': result.test_id,
+                        'test_title': result.test.title,
+                        'old': old_values,
+                        'new': new_values,
+                        'note': (
+                            'Bu qo‘lda kiritilgan natija tuzatishidir. '
+                            'StudentAnswer yozuvlari o‘zgartirilmagan.'
+                        ),
+                    }, ensure_ascii=False, default=str),
+                )
+
+    except TestResult.DoesNotExist:
+        # 404 javobi boshqa o‘qituvchining natijasi borligini ham oshkor qilmaydi.
+        return err('Natija topilmadi yoki sizga tegishli emas.', 404)
+
+    return Response({
+        'updated': True,
+        'result': {
+            'id': result.id,
+            'correct_count': result.correct_count,
+            'wrong_count': result.wrong_count,
+            'percentage': result.percentage,
+            'grade': result.grade,
+            'earned_points': result.earned_points,
+        },
+    })
 
 
 @api_view(['GET'])
@@ -630,12 +832,79 @@ def review_violation(r, pk):
 @permission_classes([IsAuthenticated])
 def teacher_profile(r):
     u, t = teacher_required(r)
-    if not u:
+    if not u or not t:
         return err('Ruxsat yo‘q.', 403)
-    t.bio = str(r.data.get('bio', t.bio))
-    t.phone = str(r.data.get('phone', t.phone))
-    t.save()
-    return Response({'saved': True})
+
+    first_name = str(r.data.get('firstName', t.first_name)).strip()
+    last_name = str(r.data.get('lastName', t.last_name)).strip()
+    bio = str(r.data.get('bio', t.bio)).strip()
+    phone = str(r.data.get('phone', t.phone)).strip()
+
+    if len(first_name) < 2 or len(last_name) < 2:
+        return err('Ism va familiya kamida 2 ta belgidan iborat bo‘lishi kerak.')
+
+    current_password = str(r.data.get('currentPassword') or '')
+    new_password = str(r.data.get('newPassword') or '')
+
+    if current_password or new_password:
+        if not current_password or not new_password:
+            return err('Parolni almashtirish uchun joriy va yangi parolni kiriting.')
+        if not check_password(current_password, u.password_hash):
+            return err('Joriy parol noto‘g‘ri.', 403)
+        if len(new_password) < 8:
+            return err('Yangi parol kamida 8 ta belgidan iborat bo‘lishi kerak.')
+
+    old_profile = {
+        'first_name': t.first_name,
+        'last_name': t.last_name,
+        'phone': t.phone,
+        'bio': t.bio,
+        'password_changed': False,
+    }
+
+    with transaction.atomic():
+        t.first_name = first_name
+        t.last_name = last_name
+        t.phone = phone
+        t.bio = bio
+        t.save(update_fields=['first_name', 'last_name', 'phone', 'bio'])
+
+        u.full_name = f'{first_name} {last_name}'.strip()
+        if new_password:
+            u.password_hash = make_password(new_password)
+            old_profile['password_changed'] = True
+        u.save(update_fields=['full_name', 'password_hash'])
+
+        new_profile = {
+            'first_name': t.first_name,
+            'last_name': t.last_name,
+            'phone': t.phone,
+            'bio': t.bio,
+            'password_changed': bool(new_password),
+        }
+
+        if old_profile != new_profile:
+            Activity.objects.create(
+                actor_role='teacher',
+                actor_name=u.full_name,
+                action='O‘qituvchi profilini yangiladi',
+                target_type='Teacher',
+                target_id=str(t.id),
+                details=json.dumps({
+                    'old': old_profile,
+                    'new': new_profile,
+                }, ensure_ascii=False),
+            )
+
+    return Response({
+        'success': True,
+        'saved': True,
+        'fullName': u.full_name,
+        'firstName': t.first_name,
+        'lastName': t.last_name,
+        'phone': t.phone,
+        'bio': t.bio,
+    })
 
 
 # ---------------------------------------------------------------- admin
