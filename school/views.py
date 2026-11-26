@@ -183,6 +183,8 @@ def teacher_required(r):
     return u,Teacher.objects.get(user=u)
 def test_json(t):
     return {'id':t.id,'teacher_id':t.teacher_id,'subject_id':t.subject_id,'class_id':t.school_class_id,'title':t.title,'description':t.description,'duration_minutes':t.duration_minutes,'max_attempts':t.max_attempts,'starts_at':t.starts_at,'ends_at':t.ends_at,'status':t.status,'subject_name':t.subject.name,'class_name':t.school_class.name,'teacher_name':t.teacher.first_name+' '+t.teacher.last_name,'question_count':t.questions.count(),'submission_count':TestResult.objects.filter(test=t).count(),'created_at':t.created_at}
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def teacher_meta(r):
     u,t=teacher_required(r)
     if not u:return err('Ruxsat yo‘q.',403)
@@ -370,3 +372,9 @@ def admin_settings(r):
             if u:u.password_hash=make_password(str(p));u.save()
         return Response({'saved':True})
     return Response({'schoolName':Setting.objects.get_or_create(key='school_name',defaults={'value':'SCHOOL TEST SYSTEM'})[0].value,'envManagedPassword':bool(os.getenv('ADMIN_PASSWORD'))})
+from django.http import JsonResponse
+from django.views.decorators.http import require_http_methods
+
+@require_http_methods(["GET","HEAD"])
+def health(request):
+    return JsonResponse({"status":"ok"})

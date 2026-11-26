@@ -1,6 +1,7 @@
 from django.urls import path
 from . import views
 urlpatterns=[
+ path('health/',views.health),
  path('public/bootstrap',views.public_bootstrap),
  path('auth/admin/status',views.admin_status),path('auth/admin/claim',views.admin_claim),path('auth/admin/login',views.admin_login),path('auth/teacher/login',views.teacher_login),path('auth/student/login',views.student_login),path('auth/me',views.auth_me),
  path('student/tests',views.student_tests),path('student/tests/<int:test_id>/start',views.start_test),path('student/attempts/<int:attempt_id>/answer',views.save_answer),path('student/attempts/<int:attempt_id>/submit',views.submit_attempt),path('student/attempts/<int:attempt_id>/violation',views.violation),
