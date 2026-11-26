@@ -2,7 +2,7 @@ import os, secrets, string
 from datetime import timedelta
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Count, Avg, Q
+from django.db.models import Count, Avg, Q, Min, Max
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.contrib.auth.hashers import make_password, check_password
@@ -466,10 +466,8 @@ def _dash_payload(t):
     class_stats = []
     for row in results.values('school_class__name').annotate(avg=Avg('percentage'), cnt=Count('id')):
         a = round(row['avg'] or 0, 1)
-        class_stats.append({'class_name': row['school_class__name'], 'className': row['school_class__name'],
-                            'name': row['school_class__name'], 'avg_percentage': a, 'avgPercentage': a,
-                            'average': a, 'submission_count': row['cnt'], 'submissions': row['cnt'],
-                            'count': row['cnt']})
+        class_stats.append({'class_name': row['school_class__name'], 'avg_percentage': a,
+                            'submissions': row['cnt']})
     grades = [{'grade': g, 'count': results.filter(grade=g).count()} for g in ['5', '4', '3', '2']]
     return {
         'stats': {'totalTests': tests.count(), 'activeTests': tests.filter(status='active').count(),
@@ -517,22 +515,31 @@ def teacher_stats(r):
     test_stats = []
     for x in Test.objects.filter(teacher=t).select_related('subject', 'school_class'):
         rs = TestResult.objects.filter(test=x)
-        a = round(rs.aggregate(v=Avg('percentage'))['v'] or 0, 1)
-        test_stats.append({'test_id': x.id, 'id': x.id, 'title': x.title, 'test_title': x.title,
-                           'class_name': x.school_class.name, 'subject_name': x.subject.name,
-                           'submission_count': rs.count(), 'submissions': rs.count(),
-                           'avg_percentage': a, 'avgPercentage': a, 'average': a})
+        agg = rs.aggregate(a=Avg('percentage'), mn=Min('percentage'), mx=Max('percentage'))
+        test_stats.append({
+            'id': x.id,
+            'title': x.title,
+            'subject_name': x.subject.name,
+            'class_name': x.school_class.name,
+            'submissions': rs.count(),
+            'avg_percentage': round(agg['a'] or 0, 1),
+            'min_percentage': agg['mn'],
+            'max_percentage': agg['mx'],
+            'grade_5': rs.filter(grade='5').count(),
+            'grade_4': rs.filter(grade='4').count(),
+            'grade_3': rs.filter(grade='3').count(),
+            'grade_2': rs.filter(grade='2').count(),
+        })
     qa = []
     for row in StudentAnswer.objects.filter(question__test__teacher=t).values(
             'question_id', 'question__question_text', 'question__test__title').annotate(
             total=Count('id'), correct=Count('id', filter=Q(is_correct=True))):
-        acc = round(row['correct'] * 100 / row['total'], 1) if row['total'] else 0
-        qa.append({'question_id': row['question_id'], 'id': row['question_id'],
+        qa.append({'id': row['question_id'],
                    'question_text': row['question__question_text'],
-                   'questionText': row['question__question_text'],
-                   'test_title': row['question__test__title'], 'total_answers': row['total'],
-                   'correct_answers': row['correct'], 'total': row['total'], 'correct': row['correct'],
-                   'accuracy': acc, 'percentage': acc})
+                   'test_title': row['question__test__title'],
+                   'total_answers': row['total'],
+                   'correct_answers': row['correct']})
+    qa.sort(key=lambda x: (x['correct_answers'] / x['total_answers']) if x['total_answers'] else 1)
     data['testStats'] = test_stats
     data['questionAccuracy'] = qa
     return Response(data)
