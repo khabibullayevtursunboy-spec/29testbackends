@@ -46,4 +46,6 @@ urlpatterns = [
     path('admin/students/<int:pk>', views.admin_student_item),
     path('admin/activity', views.admin_activity),
     path('admin/settings', views.admin_settings),
+    path('auth/teacher/register', views.teacher_register),
+   
 ]

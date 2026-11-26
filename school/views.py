@@ -193,38 +193,79 @@ def admin_login(r):
 
 
 @api_view(['POST'])
-def teacher_login(r):
-    full = ' '.join(str(r.data.get('fullName', '')).split())
-    cid = r.data.get('classId')
-    sid = r.data.get('subjectId')
+@permission_classes([])
+def teacher_register(r):
+    username = str(r.data.get('username', '')).strip().lower()
+    password = str(r.data.get('password', ''))
+    full_name = str(r.data.get('fullName', '')).strip()
+    class_id = r.data.get('classId')
+    subject_id = r.data.get('subjectId')
+
+    if not username or len(username) < 3:
+        return err('Login kamida 3 ta belgidan iborat bo‘lsin.')
+
+    if len(password) < 8:
+        return err('Parol kamida 8 ta belgidan iborat bo‘lsin.')
+
+    if not full_name:
+        return err('Ism-familiyani kiriting.')
+
+    if User.objects.filter(username=username).exists():
+        return err('Bu login band.')
+
     try:
-        cls = SchoolClass.objects.get(id=cid, is_active=True)
-        subj = Subject.objects.get(id=sid, is_active=True)
-    except Exception:
-        return err('Tanlangan sinf yoki fan topilmadi.')
-    if len(full) < 2:
-        return err('Ismingizni kiriting.')
-    u = User.objects.filter(role='teacher', full_name__iexact=full).first()
-    if u and not u.is_active:
+        cls = SchoolClass.objects.get(id=class_id, is_active=True)
+        subj = Subject.objects.get(id=subject_id, is_active=True)
+    except (SchoolClass.DoesNotExist, Subject.DoesNotExist, ValueError, TypeError):
+        return err('Sinf yoki fan noto‘g‘ri tanlangan.')
+
+    parts = full_name.split()
+
+    with transaction.atomic():
+        user = User(
+            username=username,
+            role='teacher',
+            full_name=full_name,
+            is_active=True,
+            is_approved=False
+        )
+        user.set_password(password)
+        user.save()
+
+        Teacher.objects.create(
+            user=user,
+            first_name=parts[0],
+            last_name=' '.join(parts[1:]) or parts[0],
+            subject_names=[subj.name],
+            assigned_classes=[cls.name]
+        )
+
+    return Response({
+        'registered': True,
+        'message': 'Ro‘yxatdan o‘tildi. Admin tasdiqlashini kuting.'
+    }, status=201)
+
+
+@api_view(['POST'])
+def teacher_login(r):
+    username = str(r.data.get('username', '')).strip().lower()
+    password = str(r.data.get('password', ''))
+
+    u = User.objects.filter(username=username, role='teacher').first()
+
+    if not u or not check_password(password, u.password_hash):
+        return err('Login yoki parol noto‘g‘ri.', 401)
+
+    if not u.is_active:
         return err('Hisobingiz bloklangan.', 403)
-    if not u:
-        parts = full.split()
-        username = 'teacher_' + secrets.token_hex(5)
-        u = User(username=username, role='teacher', full_name=full,
-                 password_hash=make_password(secrets.token_urlsafe(24)))
-        u.save()
-        Teacher.objects.create(user=u, first_name=parts[0], last_name=' '.join(parts[1:]) or 'O‘qituvchi',
-                               subject_names=[subj.name], assigned_classes=[cls.name])
-    else:
-        t = Teacher.objects.get(user=u)
-        if subj.name not in t.subject_names:
-            t.subject_names.append(subj.name)
-        if cls.name not in t.assigned_classes:
-            t.assigned_classes.append(cls.name)
-        t.save()
-    return Response({'token': token_for(u), 'user': user_payload(u)})
 
+    if not u.is_approved:
+        return err('Hisobingiz hali administrator tomonidan tasdiqlanmagan.', 403)
 
+    return Response({
+        'token': token_for(u),
+        'user': user_payload(u)
+    })
 @api_view(['POST'])
 def student_login(r):
     fn = str(r.data.get('firstName', '')).strip()
@@ -931,20 +972,82 @@ def admin_dashboard(r):
 def admin_teachers(r):
     if not admin_guard(r):
         return err('Ruxsat yo‘q.', 403)
+
     if r.method == 'POST':
         d = r.data
-        full = str(d.get('fullName', d.get('full_name', 'O‘qituvchi')))
-        parts = full.split()
-        u = User(username=str(d.get('username') or 'teacher_' + secrets.token_hex(4)), role='teacher',
-                 full_name=full, password_hash=make_password(str(d.get('password') or secrets.token_urlsafe(16))))
-        u.save()
-        t = Teacher.objects.create(user=u, first_name=parts[0], last_name=' '.join(parts[1:]) or 'O‘qituvchi')
-        return Response({'id': t.id})
-    return Response({'teachers': [{
-        'id': t.id, 'fullName': t.first_name + ' ' + t.last_name, 'username': t.user.username,
-        'subjectNames': t.subject_names, 'assignedClasses': t.assigned_classes,
-        'testCount': Test.objects.filter(teacher=t).count(), 'isActive': t.user.is_active}
-        for t in Teacher.objects.select_related('user')]})
+        full = ' '.join(str(d.get('fullName') or d.get('full_name') or '').split())
+        first_name = str(d.get('firstName') or '').strip()
+        last_name = str(d.get('lastName') or '').strip()
+
+        if not first_name and not last_name:
+            parts = full.split()
+            first_name = parts[0] if parts else ''
+            last_name = ' '.join(parts[1:])
+        elif not first_name or not last_name:
+            parts = full.split()
+            first_name = first_name or (parts[0] if parts else '')
+            last_name = last_name or (' '.join(parts[1:]) if len(parts) > 1 else '')
+
+        full = f'{first_name} {last_name}'.strip()
+        username = str(d.get('username') or 'teacher_' + secrets.token_hex(4)).strip().lower()
+        password = str(d.get('password') or secrets.token_urlsafe(16))
+
+        if len(first_name) < 2 or len(last_name) < 2:
+            return err('O‘qituvchining ism va familiyasini to‘liq kiriting.')
+        if len(username) < 3:
+            return err('Login kamida 3 ta belgidan iborat bo‘lsin.')
+        if User.objects.filter(username=username).exists():
+            return err('Bu login band.')
+        if len(password) < 8:
+            return err('Parol kamida 8 ta belgidan iborat bo‘lsin.')
+
+        subject_names = d.get('subjectNames', []) or []
+        assigned_classes = d.get('assignedClasses', []) or []
+        if not isinstance(subject_names, list) or not isinstance(assigned_classes, list):
+            return err('Fanlar va sinflar ro‘yxat shaklida yuborilishi kerak.')
+
+        with transaction.atomic():
+            u = User(
+                username=username,
+                role='teacher',
+                full_name=full,
+                password_hash=make_password(password),
+                is_active=bool(d.get('isActive', True)),
+                is_approved=bool(d.get('isApproved', True)),
+            )
+            u.save()
+
+            t = Teacher.objects.create(
+                user=u,
+                first_name=first_name,
+                last_name=last_name,
+                subject_names=[str(x).strip() for x in subject_names if str(x).strip()],
+                assigned_classes=[str(x).strip() for x in assigned_classes if str(x).strip()],
+                bio=str(d.get('bio') or '').strip(),
+                phone=str(d.get('phone') or '').strip(),
+            )
+
+        return Response({'id': t.id, 'username': u.username}, status=201)
+
+    return Response({
+        'teachers': [
+            {
+                'id': t.id,
+                'fullName': t.first_name + ' ' + t.last_name,
+                'firstName': t.first_name,
+                'lastName': t.last_name,
+                'username': t.user.username,
+                'subjectNames': t.subject_names,
+                'assignedClasses': t.assigned_classes,
+                'phone': t.phone,
+                'bio': t.bio,
+                'testCount': Test.objects.filter(teacher=t).count(),
+                'isActive': t.user.is_active,
+                'isApproved': t.user.is_approved,
+            }
+            for t in Teacher.objects.select_related('user').order_by('first_name', 'last_name')
+        ]
+    })
 
 
 @api_view(['PUT', 'DELETE'])
@@ -952,18 +1055,64 @@ def admin_teachers(r):
 def admin_teacher_item(r, pk):
     if not admin_guard(r):
         return err('Ruxsat yo‘q.', 403)
+
     try:
         t = Teacher.objects.select_related('user').get(id=pk)
-    except Exception:
+    except Teacher.DoesNotExist:
         return err('O‘qituvchi topilmadi.', 404)
+
+    u = t.user
+
     if r.method == 'DELETE':
-        t.user.delete()
+        u.delete()
         return Response({'deleted': True})
-    t.first_name = r.data.get('firstName', t.first_name)
-    t.last_name = r.data.get('lastName', t.last_name)
-    t.user.is_active = bool(r.data.get('isActive', t.user.is_active))
-    t.user.save()
-    t.save()
+
+    d = r.data
+    first_name = str(d.get('firstName', t.first_name)).strip()
+    last_name = str(d.get('lastName', t.last_name)).strip()
+    if len(first_name) < 2 or len(last_name) < 2:
+        return err('Ism va familiya kamida 2 ta belgidan iborat bo‘lishi kerak.')
+
+    username = str(d.get('username', u.username)).strip().lower()
+    if len(username) < 3:
+        return err('Login kamida 3 ta belgidan iborat bo‘lsin.')
+    if User.objects.exclude(id=u.id).filter(username=username).exists():
+        return err('Bu login band.')
+
+    new_password = str(d.get('newPassword') or '')
+    if new_password and len(new_password) < 8:
+        return err('Yangi parol kamida 8 ta belgidan iborat bo‘lsin.')
+
+    with transaction.atomic():
+        t.first_name = first_name
+        t.last_name = last_name
+        if 'subjectNames' in d:
+            values = d.get('subjectNames') or []
+            if not isinstance(values, list):
+                return err('Fanlar ro‘yxat shaklida yuborilishi kerak.')
+            t.subject_names = [str(x).strip() for x in values if str(x).strip()]
+        if 'assignedClasses' in d:
+            values = d.get('assignedClasses') or []
+            if not isinstance(values, list):
+                return err('Sinflar ro‘yxat shaklida yuborilishi kerak.')
+            t.assigned_classes = [str(x).strip() for x in values if str(x).strip()]
+        if 'bio' in d:
+            t.bio = str(d.get('bio') or '').strip()
+        if 'phone' in d:
+            t.phone = str(d.get('phone') or '').strip()
+
+        u.username = username
+        u.full_name = f'{first_name} {last_name}'.strip()
+        if 'isActive' in d:
+            u.is_active = bool(d.get('isActive'))
+        if 'isApproved' in d:
+            u.is_approved = bool(d.get('isApproved'))
+        if new_password:
+            u.password_hash = make_password(new_password)
+
+        t.save()
+        u.save()
+
     return Response({'saved': True})
 
 

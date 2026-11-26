@@ -8,7 +8,12 @@ class User(models.Model):
     @property
     def is_anonymous(self): return False
     ROLE=[('admin','admin'),('teacher','teacher'),('student','student')]
-    username=models.CharField(max_length=100,unique=True); password_hash=models.CharField(max_length=256); role=models.CharField(max_length=10,choices=ROLE); full_name=models.CharField(max_length=200); is_active=models.BooleanField(default=True)
+    username = models.CharField(max_length=100, unique=True)
+    password_hash = models.CharField(max_length=256)
+    role = models.CharField(max_length=10, choices=ROLE)
+    full_name = models.CharField(max_length=200)
+    is_active = models.BooleanField(default=True)
+    is_approved = models.BooleanField(default=True)
     def set_password(self,p): self.password_hash=make_password(p)
     def check_password(self,p): return check_password(p,self.password_hash)
 class SchoolClass(models.Model):
