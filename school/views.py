@@ -10,6 +10,10 @@ from django.contrib.auth.hashers import make_password, check_password
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from docx import Document
+from io import BytesIO
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from rest_framework_simplejwt.tokens import AccessToken
 from .models import *
 
@@ -526,6 +530,140 @@ def _dash_payload(t):
         'gradeDistribution': grades,
     }
 
+
+
+
+# ---------------------------------------------------------------- Word document -> AI question drafts
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def teacher_import_word(r):
+    u, teacher = teacher_required(r)
+    if not u or not teacher:
+        return err('Ruxsat yo‘q.', 403)
+
+    uploaded = r.FILES.get('file')
+    if not uploaded:
+        return err('Word fayl tanlanmagan.')
+    if not uploaded.name.lower().endswith('.docx'):
+        return err('Hozircha faqat .docx formatidagi Word fayllari qo‘llab-quvvatlanadi.')
+    if uploaded.size > 15 * 1024 * 1024:
+        return err('Fayl hajmi 15 MB dan oshmasligi kerak.')
+
+    api_key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not api_key:
+        return err('AI xizmati sozlanmagan. Administrator Render muhitiga OPENAI_API_KEY qo‘shishi kerak.', 503)
+
+    try:
+        document = Document(BytesIO(uploaded.read()))
+        chunks = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                line = ' | '.join(value for value in cells if value)
+                if line:
+                    chunks.append(line)
+        source_text = '\n'.join(chunks).strip()
+    except Exception:
+        return err('Word faylni o‘qib bo‘lmadi. Fayl buzilmagan .docx ekanini tekshiring.')
+
+    if len(source_text) < 30:
+        return err('Hujjat ichidan yetarli matn topilmadi.')
+    if len(source_text) > 70000:
+        source_text = source_text[:70000]
+
+    system_prompt = """Sen maktab test hujjatlarini strukturaga ajratuvchi yordamchisan.
+Faqat hujjatda bor savollarni ajrat. Yangi savol yoki variant to‘qima.
+Javob kaliti hujjatda aniq ko‘rsatilgan bo‘lsa, shundagina correct_index ber.
+Aks holda correct_index null bo‘lsin va warnings ichida o‘qituvchi javoblarni belgilashi kerakligini yoz.
+Natijani faqat JSON ko‘rinishida qaytar:
+{"title":"...","questions":[{"questionText":"...","options":["A...","B...","C...","D..."],"correct_index":0,"questionType":"single_choice"}],"warnings":[]}
+questionType faqat single_choice, multiple_choice, true_false yoki text bo‘lsin.
+Savol matnida raqam va matnni saqla. Variantlarni asl tartibida saqla.
+Agar hujjatda bir nechta test to‘plami bo‘lsa, savollarni tartib bilan ajrat.
+Eng ko‘pi bilan 80 ta savol qaytar. Savol yoki variantlar noaniq bo‘lsa, warnings ga yoz; taxmin qilma."""
+
+    payload = {
+        'model': 'gpt-4o-mini',
+        'temperature': 0,
+        'response_format': {'type': 'json_object'},
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': 'Quyidagi Word hujjatidan test savollarini ajrat:\n\n' + source_text}
+        ]
+    }
+
+    try:
+        request = Request(
+            'https://api.openai.com/v1/chat/completions',
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urlopen(request, timeout=90) as response:
+            ai_data = json.loads(response.read().decode('utf-8'))
+        raw = ai_data['choices'][0]['message']['content']
+        parsed = json.loads(raw)
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode('utf-8')[:500]
+        except Exception:
+            detail = ''
+        return err('AI xizmatida xatolik yuz berdi. ' + detail, 502)
+    except (URLError, TimeoutError):
+        return err('AI xizmatiga ulanib bo‘lmadi. Keyinroq qayta urinib ko‘ring.', 502)
+    except Exception:
+        return err('AI hujjatni tahlil qila olmadi. Fayl tuzilishini tekshirib qayta urinib ko‘ring.', 502)
+
+    source_questions = parsed.get('questions', [])
+    if not isinstance(source_questions, list) or not source_questions:
+        return err('Hujjatdan test savollari topilmadi.')
+    drafts = []
+    for item in source_questions[:80]:
+        if not isinstance(item, dict):
+            continue
+        question_text = str(item.get('questionText') or '').strip()
+        if not question_text:
+            continue
+        kind = item.get('questionType')
+        if kind not in ['single_choice', 'multiple_choice', 'true_false', 'text']:
+            kind = 'single_choice'
+        raw_options = item.get('options') or []
+        options = []
+        correct_index = item.get('correct_index')
+        for index, option in enumerate(raw_options[:8]):
+            option_text = str(option or '').strip()
+            if option_text:
+                options.append({
+                    'optionText': option_text,
+                    'isCorrect': isinstance(correct_index, int) and correct_index == index
+                })
+        if kind in ['single_choice', 'multiple_choice'] and len(options) < 2:
+            kind = 'text'
+            options = []
+        correct_text = str(item.get('correct_text_answer') or '').strip()
+        if kind == 'true_false' and isinstance(correct_index, int) and len(options) > correct_index:
+            correct_text = 'ha' if correct_index == 0 else 'yoq'
+        drafts.append({
+            'questionType': kind,
+            'questionText': question_text,
+            'points': 1,
+            'correctTextAnswer': correct_text,
+            'options': options
+        })
+
+    if not drafts:
+        return err('Hujjatdan yaroqli savollar ajratilmadi.')
+    warnings = parsed.get('warnings', [])
+    if not isinstance(warnings, list):
+        warnings = []
+    if any(not any(option['isCorrect'] for option in question['options']) and question['questionType'] in ['single_choice', 'multiple_choice'] for question in drafts):
+        warnings.append('Ayrim savollarning to‘g‘ri javobi hujjatda aniq ko‘rsatilmagan. Ularni qo‘lda belgilang.')
+    return Response({
+        'title': str(parsed.get('title') or uploaded.name.rsplit('.', 1)[0])[:200],
+        'questions': drafts,
+        'warnings': [str(w)[:300] for w in warnings[:10]],
+        'count': len(drafts)
+    })
 
 # ---------------------------------------------------------------- teacher endpoints
 @api_view(['GET'])
